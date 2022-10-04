@@ -103,7 +103,7 @@ minio:
   # bucketRoot: bucketRoot
   securityContext:
       # ensure the permissions are always updated for the entire volume...
-      # fsGroupChangePolicy: Always
+      fsGroupChangePolicy: Always
   # run as non-root
   makeBucketJob:
     securityContext:
@@ -123,7 +123,7 @@ minio:
     # disabling persistence so it just uses 'emptyDir' (data gone after reboot)
     # minio doesn't support this with security so no go
     # enabling this sets up pvcs, and minio consistently has issues writing to them
-    enabled: false
+    # enabled: false
     size: 5Gi
   resources:
     requests:

@@ -501,6 +501,24 @@ data:
       }
     }
 ---
+# Source: loki/charts/minio/templates/pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: loki-minio
+  namespace: "team-c3-cinemail-dev"
+  labels:
+    app: minio
+    chart: minio-4.0.12
+    release: loki
+    heritage: Helm
+spec:
+  accessModes:
+    - "ReadWriteOnce"
+  resources:
+    requests:
+      storage: "5Gi"
+---
 # Source: loki/charts/minio/templates/console-service.yaml
 apiVersion: v1
 kind: Service
@@ -736,6 +754,11 @@ spec:
         checksum/secrets: a72fe3d7c604f74ceff59f90993ea2089033357ab6235464b99dcc4df2156b9c
         checksum/config: 729d0598e2136d6a3171e290924e31c223071f26530fa531b9eec9e3c1d88fd6
     spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: Always
 
       serviceAccountName: minio-sa
       containers:
@@ -749,7 +772,9 @@ spec:
           volumeMounts:
             - name: minio-user
               mountPath: "/tmp/credentials"
-              readOnly: true            
+              readOnly: true
+            - name: export
+              mountPath: /export            
           ports:
             - name: http
               containerPort: 9000
@@ -774,7 +799,8 @@ spec:
               memory: 128Mi      
       volumes:
         - name: export
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: loki-minio
         - name: minio-user
           secret:
             secretName: loki-minio

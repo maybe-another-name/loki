@@ -1,0 +1,131 @@
+# Values for bitnami/grafana-loki.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+## RBAC
+##
+rbac.pspEnabled: false
+
+## Ingress
+##
+ingress:
+  enabled: true
+  hosts[0]: test.loki.payload.aks.internal.oss.cse-cst.gc.ca
+
+
+resources:
+  requests:
+    cpu: "1"
+    memory: "500Mi"
+  limits:
+    cpu: "2"
+    memory: "500Mi"
+
+# # ensure the bucket job runs as non-root
+# makeBucketJob.securityContext.enabled: true
+
+# disable all the self-monitoring stuff
+monitoring:
+  dashboards:
+    enabled: false
+  rules:
+    enabled: false
+    alerting: false
+  alerts:
+    enabled: false
+  serviceMonitor:
+    enabled: false
+  selfMonitoring:
+    enabled: false
+    grafanaAgent:
+      installOperator: false
+    lokiCanary:
+      enabled: false
+
+
+# disable prometheus crds
+# monitoring:
+#   rules:
+#     enabled: false
+#   alerts:
+#     enabled: false
+#   dashboards:
+#     enabled: false
+#   serviceMonitor:
+#     enabled: false
+#   selfMonitoring:
+#     enable: false
+#     enabled: false
+#     grafanaAgent.installOperator: false
+#     lokiCanary.enabled: false
+#   lokiCanary:
+#     enabled: false
+
+# monitoring:
+#   selfMonitoring:
+#     lokiCanary:
+#       enabled: false
+# monitoring.selfMonitoring.lokiCanary.enabled: false
+# monitoring.selfMonitoring.grafanaAgent.installOperator: false
+
+# selfMonitoring:
+#   enabled: false
+#   enable: false
+
+gateway.enabled: false
+
+write:
+  replicas: 1
+read:
+  replicas: 1
+
+loki:
+  storage:
+    type: s3
+    s3:
+      # s3: http://rootuser:rootpass123@local-minio-svc.:9000/loki
+      endpoint: http://local-minio:9000
+      secretAccessKey: rootpass123
+      accessKeyId: rootuser
+      s3forcepathstyle: true
+      insecure: true
+
+minio:
+  # nothing funky with drives/replicas
+  drivesPerNode: 1
+  replicas: 1
+  mode: standalone
+  enabled: true
+  rootUser: rootuser
+  rootPassword: rootpass123
+  # try setting a different mount path & root to help with permissions
+  # mountPath: /export/neath
+  # bucketRoot: bucketRoot
+  securityContext:
+      # ensure the permissions are always updated for the entire volume...
+      fsGroupChangePolicy: Always
+  # run as non-root
+  makeBucketJob:
+    securityContext:
+      enabled: true
+    # make it spit out details (debugging)
+    exitCommand: printenv&&whoami&&groups
+  # make it use a config location that works for non-root
+  configPathmc: /tmp/.mc
+  buckets:
+    - name: chunks
+      policy: none
+    - name: ruler
+      policy: none
+    - name: admin
+      policy: none
+  persistence:
+    # disabling persistence so it just uses 'emptyDir' (data gone after reboot)
+    # minio doesn't support this with security so no go
+    # enabling this sets up pvcs, and minio consistently has issues writing to them
+    # enabled: false
+    size: 5Gi
+  resources:
+    requests:
+      cpu: 200m
+      memory: 128Mi

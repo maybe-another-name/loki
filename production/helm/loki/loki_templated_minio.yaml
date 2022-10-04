@@ -1,0 +1,1261 @@
+---
+# Source: loki/charts/minio/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: "minio-sa"
+  namespace: "team-c3-cinemail-dev"
+---
+# Source: loki/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: loki
+  labels:
+    helm.sh/chart: loki-3.2.0
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/version: "2.6.1"
+    app.kubernetes.io/managed-by: Helm
+automountServiceAccountToken: true
+---
+# Source: loki/charts/minio/templates/secrets.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: loki-minio
+  namespace: "team-c3-cinemail-dev"
+  labels:
+    app: minio
+    chart: minio-4.0.12
+    release: loki
+    heritage: Helm
+type: Opaque
+data:
+  rootUser: "cm9vdHVzZXI="
+  rootPassword: "cm9vdHBhc3MxMjM="
+---
+# Source: loki/charts/minio/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-minio
+  namespace: "team-c3-cinemail-dev"
+  labels:
+    app: minio
+    chart: minio-4.0.12
+    release: loki
+    heritage: Helm
+data:
+  initialize: |-
+    #!/bin/sh
+    set -e ; # Have script exit in the event of a failed command.
+    MC_CONFIG_DIR="/tmp/.mc"
+    MC="/usr/bin/mc --insecure --config-dir ${MC_CONFIG_DIR}"
+    
+    # connectToMinio
+    # Use a check-sleep-check loop to wait for MinIO service to be available
+    connectToMinio() {
+      SCHEME=$1
+      ATTEMPTS=0 ; LIMIT=29 ; # Allow 30 attempts
+      set -e ; # fail if we can't read the keys.
+      ACCESS=$(cat /config/rootUser) ; SECRET=$(cat /config/rootPassword) ;
+      set +e ; # The connections to minio are allowed to fail.
+      echo "Connecting to MinIO server: $SCHEME://$MINIO_ENDPOINT:$MINIO_PORT" ;
+      MC_COMMAND="${MC} alias set myminio $SCHEME://$MINIO_ENDPOINT:$MINIO_PORT $ACCESS $SECRET" ;
+      $MC_COMMAND ;
+      STATUS=$? ;
+      until [ $STATUS = 0 ]
+      do
+        ATTEMPTS=`expr $ATTEMPTS + 1` ;
+        echo \"Failed attempts: $ATTEMPTS\" ;
+        if [ $ATTEMPTS -gt $LIMIT ]; then
+          exit 1 ;
+        fi ;
+        sleep 2 ; # 1 second intervals between attempts
+        $MC_COMMAND ;
+        STATUS=$? ;
+      done ;
+      set -e ; # reset `e` as active
+      return 0
+    }
+    
+    # checkBucketExists ($bucket)
+    # Check if the bucket exists, by using the exit code of `mc ls`
+    checkBucketExists() {
+      BUCKET=$1
+      CMD=$(${MC} ls myminio/$BUCKET > /dev/null 2>&1)
+      return $?
+    }
+    
+    # createBucket ($bucket, $policy, $purge)
+    # Ensure bucket exists, purging if asked to
+    createBucket() {
+      BUCKET=$1
+      POLICY=$2
+      PURGE=$3
+      VERSIONING=$4
+      OBJECTLOCKING=$5
+    
+      # Purge the bucket, if set & exists
+      # Since PURGE is user input, check explicitly for `true`
+      if [ $PURGE = true ]; then
+        if checkBucketExists $BUCKET ; then
+          echo "Purging bucket '$BUCKET'."
+          set +e ; # don't exit if this fails
+          ${MC} rm -r --force myminio/$BUCKET
+          set -e ; # reset `e` as active
+        else
+          echo "Bucket '$BUCKET' does not exist, skipping purge."
+        fi
+      fi
+    
+    # Create the bucket if it does not exist and set objectlocking if enabled (NOTE: versioning will be not changed if OBJECTLOCKING is set because it enables versioning to the Buckets created)
+    if ! checkBucketExists $BUCKET ; then
+        if [ ! -z $OBJECTLOCKING ] ; then
+          if [ $OBJECTLOCKING = true ] ; then
+              echo "Creating bucket with OBJECTLOCKING '$BUCKET'"
+              ${MC} mb --with-lock myminio/$BUCKET
+          elif [ $OBJECTLOCKING = false ] ; then
+                echo "Creating bucket '$BUCKET'"
+                ${MC} mb myminio/$BUCKET
+          fi
+      elif [ -z $OBJECTLOCKING ] ; then
+            echo "Creating bucket '$BUCKET'"
+            ${MC} mb myminio/$BUCKET
+      else
+        echo "Bucket '$BUCKET' already exists."  
+      fi
+      fi
+    
+    
+      # set versioning for bucket if objectlocking is disabled or not set
+      if [ -z $OBJECTLOCKING ] ; then
+      if [ ! -z $VERSIONING ] ; then
+        if [ $VERSIONING = true ] ; then
+            echo "Enabling versioning for '$BUCKET'"
+            ${MC} version enable myminio/$BUCKET
+        elif [ $VERSIONING = false ] ; then
+            echo "Suspending versioning for '$BUCKET'"
+            ${MC} version suspend myminio/$BUCKET
+        fi
+        fi
+      else
+          echo "Bucket '$BUCKET' versioning unchanged."
+      fi
+    
+    
+      # At this point, the bucket should exist, skip checking for existence
+      # Set policy on the bucket
+      echo "Setting policy of bucket '$BUCKET' to '$POLICY'."
+      ${MC} policy set $POLICY myminio/$BUCKET
+    }
+    
+    # Try connecting to MinIO instance
+    scheme=http
+    connectToMinio $scheme
+    
+    
+    
+    # Create the buckets
+    createBucket chunks none   
+    createBucket ruler none   
+    createBucket admin none   
+  add-user: |-
+    #!/bin/sh
+    set -e ; # Have script exit in the event of a failed command.
+    MC_CONFIG_DIR="/tmp/.mc"
+    MC="/usr/bin/mc --insecure --config-dir ${MC_CONFIG_DIR}"
+    
+    # AccessKey and secretkey credentials file are added to prevent shell execution errors caused by special characters.
+    # Special characters for example : ',",<,>,{,}
+    MINIO_ACCESSKEY_SECRETKEY_TMP="/tmp/accessKey_and_secretKey_tmp"
+    
+    # connectToMinio
+    # Use a check-sleep-check loop to wait for MinIO service to be available
+    connectToMinio() {
+      SCHEME=$1
+      ATTEMPTS=0 ; LIMIT=29 ; # Allow 30 attempts
+      set -e ; # fail if we can't read the keys.
+      ACCESS=$(cat /config/rootUser) ; SECRET=$(cat /config/rootPassword) ;
+      set +e ; # The connections to minio are allowed to fail.
+      echo "Connecting to MinIO server: $SCHEME://$MINIO_ENDPOINT:$MINIO_PORT" ;
+      MC_COMMAND="${MC} alias set myminio $SCHEME://$MINIO_ENDPOINT:$MINIO_PORT $ACCESS $SECRET" ;
+      $MC_COMMAND ;
+      STATUS=$? ;
+      until [ $STATUS = 0 ]
+      do
+        ATTEMPTS=`expr $ATTEMPTS + 1` ;
+        echo \"Failed attempts: $ATTEMPTS\" ;
+        if [ $ATTEMPTS -gt $LIMIT ]; then
+          exit 1 ;
+        fi ;
+        sleep 2 ; # 1 second intervals between attempts
+        $MC_COMMAND ;
+        STATUS=$? ;
+      done ;
+      set -e ; # reset `e` as active
+      return 0
+    }
+    
+    # checkUserExists ()
+    # Check if the user exists, by using the exit code of `mc admin user info`
+    checkUserExists() {
+      CMD=$(${MC} admin user info myminio $(head -1 $MINIO_ACCESSKEY_SECRETKEY_TMP) > /dev/null 2>&1)
+      return $?
+    }
+    
+    # createUser ($policy)
+    createUser() {
+      POLICY=$1
+      #check accessKey_and_secretKey_tmp file
+      if [[ ! -f $MINIO_ACCESSKEY_SECRETKEY_TMP ]];then
+        echo "credentials file does not exist"
+        return 1
+      fi
+      if [[ $(cat $MINIO_ACCESSKEY_SECRETKEY_TMP|wc -l) -ne 2 ]];then
+        echo "credentials file is invalid"
+        rm -f $MINIO_ACCESSKEY_SECRETKEY_TMP
+        return 1
+      fi
+      USER=$(head -1 $MINIO_ACCESSKEY_SECRETKEY_TMP)
+      # Create the user if it does not exist
+      if ! checkUserExists ; then
+        echo "Creating user '$USER'"
+        cat $MINIO_ACCESSKEY_SECRETKEY_TMP | ${MC} admin user add myminio
+      else
+        echo "User '$USER' already exists."
+      fi
+      #clean up credentials files.
+      rm -f $MINIO_ACCESSKEY_SECRETKEY_TMP
+    
+      # set policy for user
+      if [ ! -z $POLICY -a $POLICY != " " ] ; then
+          echo "Adding policy '$POLICY' for '$USER'"
+          ${MC} admin policy set myminio $POLICY user=$USER
+      else
+          echo "User '$USER' has no policy attached."
+      fi
+    }
+    
+    # Try connecting to MinIO instance
+    scheme=http
+    connectToMinio $scheme
+    
+    
+    
+    # Create the users
+    echo console > $MINIO_ACCESSKEY_SECRETKEY_TMP
+    echo console123 >> $MINIO_ACCESSKEY_SECRETKEY_TMP
+    createUser consoleAdmin
+    
+  add-policy: |-
+    #!/bin/sh
+    set -e ; # Have script exit in the event of a failed command.
+    MC_CONFIG_DIR="/tmp/.mc"
+    MC="/usr/bin/mc --insecure --config-dir ${MC_CONFIG_DIR}"
+    
+    # connectToMinio
+    # Use a check-sleep-check loop to wait for MinIO service to be available
+    connectToMinio() {
+      SCHEME=$1
+      ATTEMPTS=0 ; LIMIT=29 ; # Allow 30 attempts
+      set -e ; # fail if we can't read the keys.
+      ACCESS=$(cat /config/rootUser) ; SECRET=$(cat /config/rootPassword) ;
+      set +e ; # The connections to minio are allowed to fail.
+      echo "Connecting to MinIO server: $SCHEME://$MINIO_ENDPOINT:$MINIO_PORT" ;
+      MC_COMMAND="${MC} alias set myminio $SCHEME://$MINIO_ENDPOINT:$MINIO_PORT $ACCESS $SECRET" ;
+      $MC_COMMAND ;
+      STATUS=$? ;
+      until [ $STATUS = 0 ]
+      do
+        ATTEMPTS=`expr $ATTEMPTS + 1` ;
+        echo \"Failed attempts: $ATTEMPTS\" ;
+        if [ $ATTEMPTS -gt $LIMIT ]; then
+          exit 1 ;
+        fi ;
+        sleep 2 ; # 1 second intervals between attempts
+        $MC_COMMAND ;
+        STATUS=$? ;
+      done ;
+      set -e ; # reset `e` as active
+      return 0
+    }
+    
+    # checkPolicyExists ($policy)
+    # Check if the policy exists, by using the exit code of `mc admin policy info`
+    checkPolicyExists() {
+      POLICY=$1
+      CMD=$(${MC} admin policy info myminio $POLICY > /dev/null 2>&1)
+      return $?
+    }
+    
+    # createPolicy($name, $filename)
+    createPolicy () {
+      NAME=$1
+      FILENAME=$2
+    
+      # Create the name if it does not exist
+      echo "Checking policy: $NAME (in /config/$FILENAME.json)"
+      if ! checkPolicyExists $NAME ; then
+        echo "Creating policy '$NAME'"
+      else
+        echo "Policy '$NAME' already exists."
+      fi
+      ${MC} admin policy add myminio $NAME /config/$FILENAME.json
+    
+    }
+    
+    # Try connecting to MinIO instance
+    scheme=http
+    connectToMinio $scheme
+    
+    
+  custom-command: |-
+    #!/bin/sh
+    set -e ; # Have script exit in the event of a failed command.
+    MC_CONFIG_DIR="/tmp/.mc"
+    MC="/usr/bin/mc --insecure --config-dir ${MC_CONFIG_DIR}"
+    
+    # connectToMinio
+    # Use a check-sleep-check loop to wait for MinIO service to be available
+    connectToMinio() {
+      SCHEME=$1
+      ATTEMPTS=0 ; LIMIT=29 ; # Allow 30 attempts
+      set -e ; # fail if we can't read the keys.
+      ACCESS=$(cat /config/rootUser) ; SECRET=$(cat /config/rootPassword) ;
+      set +e ; # The connections to minio are allowed to fail.
+      echo "Connecting to MinIO server: $SCHEME://$MINIO_ENDPOINT:$MINIO_PORT" ;
+      MC_COMMAND="${MC} alias set myminio $SCHEME://$MINIO_ENDPOINT:$MINIO_PORT $ACCESS $SECRET" ;
+      $MC_COMMAND ;
+      STATUS=$? ;
+      until [ $STATUS = 0 ]
+      do
+        ATTEMPTS=`expr $ATTEMPTS + 1` ;
+        echo \"Failed attempts: $ATTEMPTS\" ;
+        if [ $ATTEMPTS -gt $LIMIT ]; then
+          exit 1 ;
+        fi ;
+        sleep 2 ; # 1 second intervals between attempts
+        $MC_COMMAND ;
+        STATUS=$? ;
+      done ;
+      set -e ; # reset `e` as active
+      return 0
+    }
+    
+    # runCommand ($@)
+    # Run custom mc command
+    runCommand() {
+      ${MC} "$@"
+      return $?
+    }
+    
+    # Try connecting to MinIO instance
+    scheme=http
+    connectToMinio $scheme
+---
+# Source: loki/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki
+  labels:
+    helm.sh/chart: loki-3.2.0
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/version: "2.6.1"
+    app.kubernetes.io/managed-by: Helm
+data:
+  config.yaml: |
+    auth_enabled: true
+    common:
+      path_prefix: /var/loki
+      replication_factor: 3
+      storage:
+        s3:
+          access_key_id: rootuser
+          bucketnames: chunks
+          endpoint: loki-minio.team-c3-cinemail-dev.svc:9000
+          insecure: true
+          s3forcepathstyle: true
+          secret_access_key: rootpass123
+    limits_config:
+      enforce_metric_name: false
+      max_cache_freshness_per_query: 10m
+      reject_old_samples: true
+      reject_old_samples_max_age: 168h
+      split_queries_by_interval: 15m
+    memberlist:
+      join_members:
+      - loki-memberlist
+    query_range:
+      align_queries_with_step: true
+    ruler:
+      storage:
+        s3:
+          bucketnames: ruler
+    schema_config:
+      configs:
+      - from: "2022-01-11"
+        index:
+          period: 24h
+          prefix: loki_index_
+        object_store: s3
+        schema: v12
+        store: boltdb-shipper
+    server:
+      grpc_listen_port: 9095
+      http_listen_port: 3100
+    storage_config:
+      hedging:
+        at: 250ms
+        max_per_second: 20
+        up_to: 3
+---
+# Source: loki/templates/gateway/configmap-gateway.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-gateway
+  labels:
+    helm.sh/chart: loki-3.2.0
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/version: "2.6.1"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: gateway
+data:
+  nginx.conf: |
+    worker_processes  5;  ## Default: 1
+    error_log  /dev/stderr;
+    pid        /tmp/nginx.pid;
+    worker_rlimit_nofile 8192;
+    
+    events {
+      worker_connections  4096;  ## Default: 1024
+    }
+    
+    http {
+      client_body_temp_path /tmp/client_temp;
+      proxy_temp_path       /tmp/proxy_temp_path;
+      fastcgi_temp_path     /tmp/fastcgi_temp;
+      uwsgi_temp_path       /tmp/uwsgi_temp;
+      scgi_temp_path        /tmp/scgi_temp;
+    
+      proxy_http_version    1.1;
+    
+      default_type application/octet-stream;
+      log_format   main '$remote_addr - $remote_user [$time_local]  $status '
+            '"$request" $body_bytes_sent "$http_referer" '
+            '"$http_user_agent" "$http_x_forwarded_for"';
+      access_log   /dev/stderr  main;
+    
+      sendfile     on;
+      tcp_nopush   on;
+      resolver kube-dns.kube-system.svc.cluster.local;
+    
+      server {
+        listen             8080;
+    
+        location = / {
+          return 200 'OK';
+          auth_basic off;
+        }
+    
+        location = /api/prom/push {
+          proxy_pass       http://loki-write.team-c3-cinemail-dev.svc.cluster.local:3100$request_uri;
+        }
+    
+        location = /api/prom/tail {
+          proxy_pass       http://loki-read.team-c3-cinemail-dev.svc.cluster.local:3100$request_uri;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection "upgrade";
+        }
+    
+        location ~ /api/prom/.* {
+          proxy_pass       http://loki-read.team-c3-cinemail-dev.svc.cluster.local:3100$request_uri;
+        }
+    
+        location ~ /prometheus/api/v1/alerts.* {
+          proxy_pass       http://loki-read.team-c3-cinemail-dev.svc.cluster.local:3100$request_uri;
+        }
+    
+        location ~ /prometheus/api/v1/rules.* {
+          proxy_pass       http://loki-read.team-c3-cinemail-dev.svc.cluster.local:3100$request_uri;
+        }
+    
+        location = /loki/api/v1/push {
+          proxy_pass       http://loki-write.team-c3-cinemail-dev.svc.cluster.local:3100$request_uri;
+        }
+    
+        location = /loki/api/v1/tail {
+          proxy_pass       http://loki-read.team-c3-cinemail-dev.svc.cluster.local:3100$request_uri;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection "upgrade";
+        }
+    
+        location ~ /loki/api/.* {
+          proxy_pass       http://loki-read.team-c3-cinemail-dev.svc.cluster.local:3100$request_uri;
+        }
+      }
+    }
+---
+# Source: loki/charts/minio/templates/console-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki-minio-console
+  namespace: "team-c3-cinemail-dev"
+  labels:
+    app: minio
+    chart: minio-4.0.12
+    release: loki
+    heritage: Helm
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 9001
+      protocol: TCP
+      targetPort: 9001
+  selector:
+    app: minio
+    release: loki
+---
+# Source: loki/charts/minio/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki-minio
+  namespace: "team-c3-cinemail-dev"
+  labels:
+    app: minio
+    chart: minio-4.0.12
+    release: loki
+    heritage: Helm
+    monitoring: "true"
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 9000
+      protocol: TCP
+      targetPort: 9000
+  selector:
+    app: minio
+    release: loki
+---
+# Source: loki/templates/gateway/service-gateway.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki-gateway
+  labels:
+    helm.sh/chart: loki-3.2.0
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/version: "2.6.1"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: gateway
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/component: gateway
+---
+# Source: loki/templates/read/service-read-headless.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki-read-headless
+  labels:
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/component: read
+    prometheus.io/service-monitor: "false"
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: http-metrics
+      port: 3100
+      targetPort: http-metrics
+      protocol: TCP
+    - name: grpc
+      port: 9095
+      targetPort: grpc
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/component: read
+---
+# Source: loki/templates/read/service-read.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki-read
+  labels:
+    helm.sh/chart: loki-3.2.0
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/version: "2.6.1"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: read
+spec:
+  type: ClusterIP
+  ports:
+    - name: http-metrics
+      port: 3100
+      targetPort: http-metrics
+      protocol: TCP
+    - name: grpc
+      port: 9095
+      targetPort: grpc
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/component: read
+---
+# Source: loki/templates/service-memberlist.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki-memberlist
+  labels:
+    helm.sh/chart: loki-3.2.0
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/version: "2.6.1"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: tcp
+      port: 7946
+      targetPort: http-memberlist
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/part-of: memberlist
+---
+# Source: loki/templates/write/service-write-headless.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki-write-headless
+  labels:
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/component: write
+    prometheus.io/service-monitor: "false"
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: http-metrics
+      port: 3100
+      targetPort: http-metrics
+      protocol: TCP
+    - name: grpc
+      port: 9095
+      targetPort: grpc
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/component: write
+---
+# Source: loki/templates/write/service-write.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki-write
+  labels:
+    helm.sh/chart: loki-3.2.0
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/version: "2.6.1"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: write
+spec:
+  type: ClusterIP
+  ports:
+    - name: http-metrics
+      port: 3100
+      targetPort: http-metrics
+      protocol: TCP
+    - name: grpc
+      port: 9095
+      targetPort: grpc
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/component: write
+---
+# Source: loki/charts/minio/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki-minio
+  namespace: "team-c3-cinemail-dev"
+  labels:
+    app: minio
+    chart: minio-4.0.12
+    release: loki
+    heritage: Helm
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 100%
+      maxUnavailable: 0
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+      release: loki
+  template:
+    metadata:
+      name: loki-minio
+      labels:
+        app: minio
+        release: loki
+      annotations:
+        checksum/secrets: a72fe3d7c604f74ceff59f90993ea2089033357ab6235464b99dcc4df2156b9c
+        checksum/config: 729d0598e2136d6a3171e290924e31c223071f26530fa531b9eec9e3c1d88fd6
+    spec:
+
+      serviceAccountName: minio-sa
+      containers:
+        - name: minio
+          image: "quay.io/minio/minio:RELEASE.2022-08-13T21-54-44Z"
+          imagePullPolicy: IfNotPresent
+          command:
+            - "/bin/sh"
+            - "-ce"
+            - "/usr/bin/docker-entrypoint.sh minio server /export -S /etc/minio/certs/ --address :9000 --console-address :9001"
+          volumeMounts:
+            - name: minio-user
+              mountPath: "/tmp/credentials"
+              readOnly: true            
+          ports:
+            - name: http
+              containerPort: 9000
+            - name: http-console
+              containerPort: 9001
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: loki-minio
+                  key: rootUser
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: loki-minio
+                  key: rootPassword
+            - name: MINIO_PROMETHEUS_AUTH_TYPE
+              value: "public"
+          resources:
+            requests:
+              cpu: 200m
+              memory: 128Mi      
+      volumes:
+        - name: export
+          emptyDir: {}
+        - name: minio-user
+          secret:
+            secretName: loki-minio
+---
+# Source: loki/templates/gateway/deployment-gateway.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki-gateway
+  labels:
+    helm.sh/chart: loki-3.2.0
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/version: "2.6.1"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: loki
+      app.kubernetes.io/instance: loki
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      annotations:
+        checksum/config: 5aaf42208ff5cf3d3ac4bc2278e9083144f39977a1665829c02e5d153823b799
+      labels:
+        app.kubernetes.io/name: loki
+        app.kubernetes.io/instance: loki
+        app.kubernetes.io/component: gateway
+    spec:
+      serviceAccountName: loki
+      
+      securityContext:
+        fsGroup: 101
+        runAsGroup: 101
+        runAsNonRoot: true
+        runAsUser: 101
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: nginx
+          image: docker.io/nginxinc/nginx-unprivileged:1.19-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            timeoutSeconds: 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx
+            - name: tmp
+              mountPath: /tmp
+            - name: docker-entrypoint-d-override
+              mountPath: /docker-entrypoint.d
+          resources:
+            {}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: loki
+                  app.kubernetes.io/instance: loki
+                  app.kubernetes.io/component: gateway
+              topologyKey: kubernetes.io/hostname
+        
+      volumes:
+        - name: config
+          configMap:
+            name: loki-gateway
+        - name: tmp
+          emptyDir: {}
+        - name: docker-entrypoint-d-override
+          emptyDir: {}
+---
+# Source: loki/templates/read/statefulset-read.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: loki-read
+  labels:
+    app.kubernetes.io/part-of: memberlist
+    helm.sh/chart: loki-3.2.0
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/version: "2.6.1"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: read
+spec:
+  replicas: 1
+  podManagementPolicy: Parallel
+  updateStrategy:
+    rollingUpdate:
+      partition: 0
+  serviceName: loki-read-headless
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: loki
+      app.kubernetes.io/instance: loki
+      app.kubernetes.io/component: read
+  template:
+    metadata:
+      annotations:
+        checksum/config: a1bbeba942e267385e19b52e4776466f83f0e420a4ae45f49316382cad24e251
+      labels:
+        app.kubernetes.io/part-of: memberlist
+        app.kubernetes.io/name: loki
+        app.kubernetes.io/instance: loki
+        app.kubernetes.io/component: read
+    spec:
+      serviceAccountName: loki
+      automountServiceAccountToken: true
+      
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: read
+          image: docker.io/grafana/loki:2.6.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - -config.file=/etc/loki/config/config.yaml
+            - -target=read
+          ports:
+            - name: http-metrics
+              containerPort: 3100
+              protocol: TCP
+            - name: grpc
+              containerPort: 9095
+              protocol: TCP
+            - name: http-memberlist
+              containerPort: 7946
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http-metrics
+            initialDelaySeconds: 30
+            timeoutSeconds: 1
+          volumeMounts:
+            - name: config
+              mountPath: /etc/loki/config
+            - name: tmp
+              mountPath: /tmp
+            - name: data
+              mountPath: /var/loki
+          resources:
+            {}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: loki
+                  app.kubernetes.io/instance: loki
+                  app.kubernetes.io/component: read
+              topologyKey: kubernetes.io/hostname
+        
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: loki
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: "10Gi"
+---
+# Source: loki/templates/write/statefulset-write.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: loki-write
+  labels:
+    helm.sh/chart: loki-3.2.0
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/version: "2.6.1"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: write
+    app.kubernetes.io/part-of: memberlist
+spec:
+  replicas: 1
+
+  podManagementPolicy: Parallel
+  updateStrategy:
+    rollingUpdate:
+      partition: 0
+  serviceName: loki-write-headless
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: loki
+      app.kubernetes.io/instance: loki
+      app.kubernetes.io/component: write
+  template:
+    metadata:
+      annotations:
+        checksum/config: a1bbeba942e267385e19b52e4776466f83f0e420a4ae45f49316382cad24e251
+      labels:
+        app.kubernetes.io/name: loki
+        app.kubernetes.io/instance: loki
+        app.kubernetes.io/component: write
+        app.kubernetes.io/part-of: memberlist
+    spec:
+      serviceAccountName: loki
+      automountServiceAccountToken: true
+      
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+      terminationGracePeriodSeconds: 300
+      containers:
+        - name: write
+          image: docker.io/grafana/loki:2.6.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - -config.file=/etc/loki/config/config.yaml
+            - -target=write
+          ports:
+            - name: http-metrics
+              containerPort: 3100
+              protocol: TCP
+            - name: grpc
+              containerPort: 9095
+              protocol: TCP
+            - name: http-memberlist
+              containerPort: 7946
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http-metrics
+            initialDelaySeconds: 30
+            timeoutSeconds: 1
+          volumeMounts:
+            - name: config
+              mountPath: /etc/loki/config
+            - name: data
+              mountPath: /var/loki
+          resources:
+            {}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: loki
+                  app.kubernetes.io/instance: loki
+                  app.kubernetes.io/component: write
+              topologyKey: kubernetes.io/hostname
+        
+      volumes:
+        - name: config
+          configMap:
+            name: loki
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: "10Gi"
+---
+# Source: loki/templates/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: loki
+  labels:
+    helm.sh/chart: loki-3.2.0
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: loki
+    app.kubernetes.io/version: "2.6.1"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  rules:
+    - host: "loki.example.com"
+      http:
+        paths:
+          - path: /api/prom/tail
+            pathType: Prefix
+            backend:
+              service:
+                name: loki-read
+                port:
+                  number: 3100
+          - path: /loki/api/v1/tail
+            pathType: Prefix
+            backend:
+              service:
+                name: loki-read
+                port:
+                  number: 3100
+          - path: /loki/api
+            pathType: Prefix
+            backend:
+              service:
+                name: loki-read
+                port:
+                  number: 3100
+          - path: /api/prom/rules
+            pathType: Prefix
+            backend:
+              service:
+                name: loki-read
+                port:
+                  number: 3100
+          - path: /loki/api/v1/rules
+            pathType: Prefix
+            backend:
+              service:
+                name: loki-read
+                port:
+                  number: 3100
+          - path: /prometheus/api/v1/rules
+            pathType: Prefix
+            backend:
+              service:
+                name: loki-read
+                port:
+                  number: 3100
+          - path: /prometheus/api/v1/alerts
+            pathType: Prefix
+            backend:
+              service:
+                name: loki-read
+                port:
+                  number: 3100
+          - path: /api/prom/push
+            pathType: Prefix
+            backend:
+              service:
+                name: loki-write
+                port:
+                  number: 3100
+          - path: /loki/api/v1/push
+            pathType: Prefix
+            backend:
+              service:
+                name: loki-write
+                port:
+                  number: 3100
+---
+# Source: loki/charts/minio/templates/post-install-create-bucket-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: loki-minio-make-bucket-job
+  namespace: "team-c3-cinemail-dev"
+  labels:
+    app: minio-make-bucket-job
+    chart: minio-4.0.12
+    release: loki
+    heritage: Helm
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": hook-succeeded,before-hook-creation
+spec:
+  template:
+    metadata:
+      labels:
+        app: minio-job
+        release: loki
+    spec:
+      restartPolicy: OnFailure      
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      volumes:
+        - name: minio-configuration
+          projected:
+            sources:
+            - configMap:
+                name: loki-minio
+            - secret:
+                name: loki-minio
+      containers:
+      - name: minio-mc
+        image: "quay.io/minio/mc:RELEASE.2022-08-11T00-30-48Z"
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c"]
+        args: ["/bin/sh /config/initialize; x=$(echo $?); printenv&&whoami&&groups && exit $x" ]
+        env:
+          - name: MINIO_ENDPOINT
+            value: loki-minio
+          - name: MINIO_PORT
+            value: "9000"
+        volumeMounts:
+          - name: minio-configuration
+            mountPath: /config
+        resources:
+          requests:
+            memory: 128Mi
+---
+# Source: loki/charts/minio/templates/post-install-create-user-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: loki-minio-make-user-job
+  namespace: "team-c3-cinemail-dev"
+  labels:
+    app: minio-make-user-job
+    chart: minio-4.0.12
+    release: loki
+    heritage: Helm
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": hook-succeeded,before-hook-creation
+spec:
+  template:
+    metadata:
+      labels:
+        app: minio-job
+        release: loki
+    spec:
+      restartPolicy: OnFailure      
+      volumes:
+        - name: minio-configuration
+          projected:
+            sources:
+            - configMap:
+                name: loki-minio
+            - secret:
+                name: loki-minio
+      containers:
+      - name: minio-mc
+        image: "quay.io/minio/mc:RELEASE.2022-08-11T00-30-48Z"
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "/config/add-user"]
+        env:
+          - name: MINIO_ENDPOINT
+            value: loki-minio
+          - name: MINIO_PORT
+            value: "9000"
+        volumeMounts:
+          - name: minio-configuration
+            mountPath: /config
+        resources:
+          requests:
+            memory: 128Mi
